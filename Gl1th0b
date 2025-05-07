@@ -1,0 +1,46 @@
+function Show-GlitchedAscii {
+    $counterFile = "$env:USERPROFILE\.glitchcount"
+    if (-not (Test-Path $counterFile)) { Set-Content $counterFile "0" }
+    $runCount = [int](Get-Content $counterFile)
+    if ($runCount -gt 1000) {Set-Content $counterFile "0"}
+    $runCount++; Set-Content $counterFile "$runCount"
+    $asciiArt = @"
+      _ \  |      __|                      _)  |        
+     (   |  _ \ \__ \   -_)   _|  |  |   _| |   _|  |  |
+    \___/ _.__/ ____/ \___| \__| \_,_| _|  _| \__| \_, |
+                                                   ___/ 
+"@ -split "`n"
+
+    $zalgoUp    = @([char]0x0300, [char]0x0301, [char]0x0302, [char]0x0306, [char]0x0310)
+    $zalgoDown  = @([char]0x0323, [char]0x0324, [char]0x0325, [char]0x0326, [char]0x0329)
+    $zalgoMid   = @([char]0x0334, [char]0x0335, [char]0x0336)
+    function Glitch-Char {
+        param (
+            [string]$char
+        )
+        if ($char -match '\s') { return $char }
+        $result = $char
+
+        # Randomly decide whether to add each type of diacritic (up/mid/down)
+        if ((Get-Random -Minimum 0 -Maximum 2) -eq 1) {$result += ($zalgoUp | Get-Random)}
+        if ((Get-Random -Minimum 0 -Maximum 2) -eq 1) {$result += ($zalgoMid | Get-Random)}
+        if ((Get-Random -Minimum 0 -Maximum 2) -eq 1) {$result += ($zalgoDown | Get-Random)}
+        return $result
+    }
+    function Glitch-Line {
+        param (
+            [string]$line,
+            [int]$runCount
+        )
+        $chars = $line.ToCharArray() | ForEach-Object { [string]$_ }
+        $glitchRatio = [math]::Min(0.05 + ($runCount * 0.001), 0.9)
+        $nonSpaceIndices = @(0..($chars.Length - 1) | Where-Object { $chars[$_] -notmatch '\s' })
+        $glitchCount = [math]::Ceiling($nonSpaceIndices.Count * $glitchRatio)
+        if ($glitchCount -lt 1 -or $nonSpaceIndices.Count -eq 0) {return -join $chars}
+
+        $indicesToGlitch = $nonSpaceIndices | Get-Random -Count $glitchCount
+        foreach ($i in $indicesToGlitch) {$chars[$i] = Glitch-Char $chars[$i]}
+        return -join $chars
+    }
+    foreach ($line in $asciiArt) {Write-Host (Glitch-Line $line $runCount)}
+}
