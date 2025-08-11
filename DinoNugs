@@ -1,0 +1,293 @@
+function Invoke-StegoCrypto {
+    param (
+        [Parameter(Mandatory=$true)][string]$SourceFolder,
+        [Parameter(Mandatory=$true)][string]$CarrierImagePath,
+        [Parameter(Mandatory=$true)][string]$OutputImagePath,
+        [Parameter(Mandatory=$true)][string]$Passphrase
+    )
+
+    function Collect-FilesBytes {
+        param([string]$BasePath)
+        $files = Get-ChildItem -Path $BasePath -Recurse -File
+        $ms = New-Object System.IO.MemoryStream
+        foreach ($file in $files) {
+            $relPath = $file.FullName.Substring($BasePath.Length).TrimStart('\','/')
+            $nameBytes = [System.Text.Encoding]::UTF8.GetBytes($relPath)
+            $contentBytes = [System.IO.File]::ReadAllBytes($file.FullName)
+
+            $ms.Write([System.BitConverter]::GetBytes([int]$nameBytes.Length), 0, 4)
+            $ms.Write($nameBytes, 0, $nameBytes.Length)
+            $ms.Write([System.BitConverter]::GetBytes([long]$contentBytes.Length), 0, 8)
+            $ms.Write($contentBytes, 0, $contentBytes.Length)
+        }
+        $ms.ToArray()
+    }
+
+    function Compress-Bytes {
+        param([byte[]]$Data)
+        $out = New-Object System.IO.MemoryStream
+        $gzip = New-Object System.IO.Compression.GzipStream($out, [IO.Compression.CompressionMode]::Compress)
+        $gzip.Write($Data, 0, $Data.Length)
+        $gzip.Close()
+        $out.ToArray()
+    }
+
+    function AES-Encrypt {
+        param([byte[]]$Data, [byte[]]$Key)
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        $aes.KeySize = 256; $aes.BlockSize = 128
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = $Key
+        $aes.GenerateIV()
+        $ms = New-Object System.IO.MemoryStream
+        $ms.Write($aes.IV, 0, 16)   # prefix IV
+        $encryptor = $aes.CreateEncryptor()
+        $cs = New-Object System.Security.Cryptography.CryptoStream($ms, $encryptor, [System.Security.Cryptography.CryptoStreamMode]::Write)
+        $cs.Write($Data, 0, $Data.Length); $cs.Close()
+        $ms.ToArray()
+    }
+
+    function XOR-Bytes {
+        param([byte[]]$Data, [string]$Pass)
+        $key = [System.Text.Encoding]::UTF8.GetBytes($Pass)
+        for ($i=0; $i -lt $Data.Length; $i++) {
+            $Data[$i] = $Data[$i] -bxor $key[$i % $key.Length]
+        }
+        $Data
+    }
+
+    function Embed-LSB-Fast {
+        param(
+            [string]$BmpPath,
+            [byte[]]$Data,
+            [string]$OutPath,
+            [int]$skipBits = 16384
+        )
+        Add-Type -AssemblyName System.Drawing
+        $orig = [System.Drawing.Bitmap]::FromFile($BmpPath)
+
+        if ($orig.PixelFormat -ne [System.Drawing.Imaging.PixelFormat]::Format24bppRgb) {
+            $tmp = New-Object System.Drawing.Bitmap $orig.Width, $orig.Height, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb
+            $g = [System.Drawing.Graphics]::FromImage($tmp)
+            $g.DrawImage($orig, 0, 0, $orig.Width, $orig.Height)
+            $g.Dispose()
+            $orig.Dispose()
+            $bmp = $tmp
+        } else {
+            $bmp = $orig
+        }
+
+        $rect = New-Object System.Drawing.Rectangle(0,0,$bmp.Width,$bmp.Height)
+        $bmpData = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadWrite, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        try {
+            $stride = [math]::Abs($bmpData.Stride)
+            $pixelBytes = New-Object byte[] ($stride * $bmp.Height)
+            [System.Runtime.InteropServices.Marshal]::Copy($bmpData.Scan0, $pixelBytes, 0, $pixelBytes.Length)
+
+            $bits = New-Object System.Collections.Generic.List[int]
+            foreach ($b in $Data) {
+                for ($i = 7; $i -ge 0; $i--) { $bits.Add((($b -shr $i) -band 1)) }
+            }
+
+            $capacityBits = $pixelBytes.Length
+            if ($bits.Count + $skipBits -gt $capacityBits) {
+                throw "Not enough capacity in carrier image. Need $($bits.Count) bits, have $($capacityBits - $skipBits) after skip."
+            }
+
+            for ($i=0; $i -lt $bits.Count; $i++) {
+                $idx = $i + $skipBits
+                $pixelBytes[$idx] = ($pixelBytes[$idx] -band 0xFE) -bor $bits[$i]
+            }
+
+            [System.Runtime.InteropServices.Marshal]::Copy($pixelBytes, 0, $bmpData.Scan0, $pixelBytes.Length)
+        }
+        finally {
+            $bmp.UnlockBits($bmpData)
+        }
+
+        $outDir = Split-Path $OutPath
+        if (-not (Test-Path $outDir)) {
+            New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        }
+
+        $bmp.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        $bmp.Dispose()
+    }
+
+    # --- main processing ---
+    Write-Host "Collecting files from $SourceFolder..."
+    $colBytes = Collect-FilesBytes -BasePath $SourceFolder
+
+    Write-Host "Compressing archive..."
+    $compressed = Compress-Bytes -Data $colBytes
+
+    Write-Host "Generating AES key..."
+    $aesKey = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($aesKey)
+
+    Write-Host "Encrypting compressed data with AES-256-CBC..."
+    $encrypted = AES-Encrypt -Data $compressed -Key $aesKey
+
+    $payload = $aesKey + $encrypted
+    $lengthBytes = [System.BitConverter]::GetBytes([int]$payload.Length)
+    $fullPayload = $lengthBytes + $payload
+
+    Write-Host "Applying XOR obfuscation..."
+    $xorPayload = XOR-Bytes -Data $fullPayload -Pass $Passphrase
+
+    Write-Host "Embedding payload into carrier image..."
+    Embed-LSB-Fast -BmpPath $CarrierImagePath -Data $xorPayload -OutPath $OutputImagePath -skipBits 16384
+
+    Write-Host "✅ Embedding complete: $OutputImagePath (payload bytes: $($xorPayload.Length))"
+}
+
+function Invoke-StegoDecrypto {
+    param (
+        [Parameter(Mandatory=$true)][string]$StegoImagePath,
+        [Parameter(Mandatory=$true)][string]$OutputFolder,
+        [Parameter(Mandatory=$true)][string]$Passphrase
+    )
+
+    function XOR-Bytes {
+        param([byte[]]$Data, [string]$Pass)
+        $key = [System.Text.Encoding]::UTF8.GetBytes($Pass)
+        for ($i=0; $i -lt $Data.Length; $i++) {
+            $Data[$i] = $Data[$i] -bxor $key[$i % $key.Length]
+        }
+        $Data
+    }
+
+    function AES-Decrypt {
+        param([byte[]]$Data, [byte[]]$Key)
+        $iv = $Data[0..15]
+        $cipherText = $Data[16..($Data.Length - 1)]
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        $aes.KeySize = 256; $aes.BlockSize = 128
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = $Key
+        $aes.IV = $iv
+        $ms = New-Object System.IO.MemoryStream
+        $cs = New-Object System.Security.Cryptography.CryptoStream($ms, $aes.CreateDecryptor(), [System.Security.Cryptography.CryptoStreamMode]::Write)
+        $cs.Write($cipherText, 0, $cipherText.Length)
+        $cs.Close()
+        $ms.ToArray()
+    }
+
+    function Decompress-Bytes {
+        param([byte[]]$Data)
+        $ms = New-Object System.IO.MemoryStream
+        $ms.Write($Data, 0, $Data.Length)
+        $ms.Position = 0
+        $gzip = New-Object System.IO.Compression.GzipStream($ms, [IO.Compression.CompressionMode]::Decompress)
+        $out = New-Object System.IO.MemoryStream
+        $gzip.CopyTo($out)
+        $gzip.Close()
+        $out.ToArray()
+    }
+
+    function Extract-LSB-Fast {
+        param(
+            [string]$BmpPath,
+            [int]$BytesToRead,
+            [int]$skipBits = 16384
+        )
+
+        Add-Type -AssemblyName System.Drawing
+        $bmp = [System.Drawing.Bitmap]::FromFile($BmpPath)
+
+        if ($bmp.PixelFormat -ne [System.Drawing.Imaging.PixelFormat]::Format24bppRgb) {
+            $tmp = New-Object System.Drawing.Bitmap $bmp.Width, $bmp.Height, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb
+            $g = [System.Drawing.Graphics]::FromImage($tmp)
+            $g.DrawImage($bmp, 0, 0, $bmp.Width, $bmp.Height)
+            $g.Dispose()
+            $bmp.Dispose()
+            $bmp = $tmp
+        }
+
+        $rect = New-Object System.Drawing.Rectangle(0,0,$bmp.Width,$bmp.Height)
+        $bmpData = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        try {
+            $stride = [math]::Abs($bmpData.Stride)
+            $pixelBytes = New-Object byte[] ($stride * $bmp.Height)
+            [System.Runtime.InteropServices.Marshal]::Copy($bmpData.Scan0, $pixelBytes, 0, $pixelBytes.Length)
+
+            $bitsNeeded = $BytesToRead * 8
+            $bits = New-Object byte[] $bitsNeeded
+            for ($i=0; $i -lt $bitsNeeded; $i++) {
+                $idx = $i + $skipBits
+                $bits[$i] = $pixelBytes[$idx] -band 1
+            }
+
+            $out = New-Object byte[] $BytesToRead
+            for ($b=0; $b -lt $BytesToRead; $b++) {
+                $val = 0
+                for ($bit=0; $bit -lt 8; $bit++) {
+                    $val = ($val -shl 1) -bor $bits[$b*8 + $bit]
+                }
+                $out[$b] = $val
+            }
+            return $out
+        }
+        finally {
+            $bmp.UnlockBits($bmpData)
+            $bmp.Dispose()
+        }
+    }
+
+    Write-Host "Reading length prefix (4 bytes XORed)..."
+    $prefixXor = Extract-LSB-Fast -BmpPath $StegoImagePath -BytesToRead 4 -skipBits 16384
+    $prefix = XOR-Bytes -Data $prefixXor -Pass $Passphrase
+    $length = [System.BitConverter]::ToInt32($prefix, 0)
+    Write-Host "Payload length: $length bytes"
+
+    Write-Host "Extracting full payload..."
+    $rawXor = Extract-LSB-Fast -BmpPath $StegoImagePath -BytesToRead ($length + 4) -skipBits 16384
+    $raw = XOR-Bytes -Data $rawXor -Pass $Passphrase
+
+    $payload = $raw[4..($raw.Length - 1)]
+
+    Write-Host "Splitting AES key and encrypted data..."
+    $aesKey = $payload[0..31]
+    $encryptedData = $payload[32..($payload.Length - 1)]
+
+    Write-Host "AES decrypting..."
+    $decrypted = AES-Decrypt -Data $encryptedData -Key $aesKey
+
+    Write-Host "Decompressing data..."
+    $final = Decompress-Bytes -Data $decrypted
+
+    Write-Host "Parsing archive and writing files..."
+    $ms = [System.IO.MemoryStream]::new($final)
+    while ($ms.Position -lt $ms.Length) {
+        $nameLenBytes = New-Object byte[] 4
+        $read = $ms.Read($nameLenBytes,0,4)
+        if ($read -ne 4) { break }
+        $nameLen = [System.BitConverter]::ToInt32($nameLenBytes,0)
+
+        $nameBytes = New-Object byte[] $nameLen
+        $ms.Read($nameBytes,0,$nameLen) | Out-Null
+        $relPath = [System.Text.Encoding]::UTF8.GetString($nameBytes)
+
+        $contentLenBytes = New-Object byte[] 8
+        $ms.Read($contentLenBytes,0,8) | Out-Null
+        $contentLen = [System.BitConverter]::ToInt64($contentLenBytes,0)
+
+        $contentBytes = New-Object byte[] $contentLen
+        $totalRead = 0
+        while ($totalRead -lt $contentLen) {
+            $chunkSize = [math]::Min(8MB, $contentLen - $totalRead)
+            $readBytes = $ms.Read($contentBytes, $totalRead, [int]$chunkSize)
+            if ($readBytes -le 0) { break }
+            $totalRead += $readBytes
+        }
+
+        $fullPath = Join-Path $OutputFolder $relPath
+        New-Item -ItemType Directory -Path (Split-Path $fullPath) -Force | Out-Null
+        [System.IO.File]::WriteAllBytes($fullPath, $contentBytes)
+        Write-Host "Wrote: $fullPath ($contentLen bytes)"
+    }
+
+    Write-Host "✅ Extraction complete to: $OutputFolder"
+}
